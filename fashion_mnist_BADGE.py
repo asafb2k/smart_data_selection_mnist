@@ -13,18 +13,19 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from pathlib import Path
 import copy
+from sklearn.cluster import kmeans_plusplus
 
 # --- Configuration ---
 SEED = 42
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TEST_SET_RATIO = 0.10
 VAL_SET_RATIO = 0.10
-NUM_EPOCHS = 20
+NUM_EPOCHS = 10
 BATCH_SIZE = 256
-LEARNING_RATE = 0.0005
+LEARNING_RATE = 0.001
 MAX_PERCENTAGE = 20
-OUTPUT_DIR_RANDOM = Path("output_fashion_more_epochs/entropy/random")
-OUTPUT_DIR_WISE = Path("output_fashion_more_epochs/entropy/wise")
+OUTPUT_DIR_RANDOM = Path("output_fashion/BADGE/random")
+OUTPUT_DIR_WISE = Path("output_fashion/BADGE/wise")
 
 # --- Determinism ---
 torch.manual_seed(SEED)
@@ -96,23 +97,60 @@ def evaluate(model, loader, device):
             all_labels.extend(target.cpu().numpy())
     return f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
-def select_by_entropy(pool_loader, model, k, device):
+def get_grad_embeddings(model, loader, device):
+    model.eval()
+    embeddings = []
+    
+    for data, _ in loader:
+        data = data.to(device)
+        
+        output = model(data)
+        
+        # Get pseudo-labels
+        pseudo_labels = torch.argmax(output, dim=1)
+        
+        # One-hot encode pseudo-labels
+        one_hot_labels = F.one_hot(pseudo_labels, num_classes=output.shape[1])
+        
+        # Calculate gradients for the entire batch
+        # We need to calculate the gradient of the loss with respect to the weights of the last layer.
+        # The loss for a single sample is -log(p_c), where p_c is the probability of the predicted class.
+        # The gradient of this loss with respect to the output of the last layer (logits) is (p - y),
+        # where p is the softmax output and y is the one-hot encoded label.
+        # We can then use this to calculate the gradient with respect to the weights.
+        
+        # Calculate softmax probabilities
+        probs = F.softmax(output, dim=1)
+        
+        # Gradient of the loss with respect to the output (logits)
+        grad_logits = probs - one_hot_labels
+        
+        # Get the features just before the last layer
+        features = model.get_features(data)
+        
+        # Calculate the gradient with respect to the weights of the last layer
+        # The gradient is the outer product of grad_logits and features.
+        grad_weights = torch.einsum('bi,bj->bij', grad_logits, features)
+        
+        # Reshape and append
+        batch_size = data.size(0)
+        grad_weights = grad_weights.view(batch_size, -1)
+        embeddings.append(grad_weights.cpu().detach().numpy())
+        
+    return np.concatenate(embeddings, axis=0)
+
+def select_by_badge(pool_loader, model, k, device):
     if not isinstance(pool_loader.dataset, Subset):
         raise ValueError("Expected pool_loader.dataset to be a Subset")
-    model.eval()
-    entropies = []
-    with torch.no_grad():
-        for data, _ in pool_loader:
-            data = data.to(device)
-            output = model(data)
-            log_probs = F.log_softmax(output, dim=1)
-            probs = torch.exp(log_probs)
-            entropy = -torch.sum(probs * log_probs, dim=1)
-            entropies.extend(entropy.cpu().numpy())
-    entropies = np.array(entropies)
-    selected_indices = np.argsort(-entropies)[:k]
+    
+    grad_embeddings = get_grad_embeddings(model, pool_loader, device)
+    
+    # Use k-means++ to select diverse samples
+    _, selected_indices = kmeans_plusplus(grad_embeddings, n_clusters=k, random_state=SEED)
+    
     original_indices = [pool_loader.dataset.indices[i] for i in selected_indices]
     return original_indices
+
 
 def plot_tsne(features, labels, title, filename):
     tsne = TSNE(n_components=2, random_state=SEED, perplexity=min(30, len(features)-1))
@@ -206,14 +244,14 @@ def main():
         tsne_title_rand = f"Random – {p}% Trained – Test F1={test_f1_random:.4f}"
         plot_tsne(test_features_rand, test_labels, tsne_title_rand, OUTPUT_DIR_RANDOM / f"tsne_p{p:02d}.png")
 
-        # --- Wise (Entropy-Based) Sampling ---
+        # --- Wise (BADGE-Based) Sampling ---
         num_new_samples_wise = target_size - len(acquired_indices_wise)
         if num_new_samples_wise > 0:
             if p == 1:
                 new_indices_wise = np.random.choice(remaining_pool_indices_wise, size=num_new_samples_wise, replace=False)
             else:
                 pool_loader_wise = DataLoader(Subset(full_train_dataset, remaining_pool_indices_wise), batch_size=BATCH_SIZE, shuffle=False)
-                new_indices_wise = select_by_entropy(pool_loader_wise, wise_selection_model, num_new_samples_wise, DEVICE)
+                new_indices_wise = select_by_badge(pool_loader_wise, wise_selection_model, num_new_samples_wise, DEVICE)
             acquired_indices_wise.extend(new_indices_wise)
             remaining_pool_indices_wise = [idx for idx in remaining_pool_indices_wise if idx not in new_indices_wise]
 
@@ -233,7 +271,7 @@ def main():
                 features = model_wise.get_features(data.to(DEVICE))
                 test_features_wise.append(features.cpu().numpy())
         test_features_wise = np.concatenate(test_features_wise, axis=0)
-        tsne_title_wise = f"Wise (Entropy) – {p}% Trained – Test F1={test_f1_wise:.4f}"
+        tsne_title_wise = f"Wise (BADGE) – {p}% Trained – Test F1={test_f1_wise:.4f}"
         plot_tsne(test_features_wise, test_labels, tsne_title_wise, OUTPUT_DIR_WISE / f"tsne_p{p:02d}.png")
 
         results["Percentage"].append(p)
@@ -243,12 +281,12 @@ def main():
         results["Wise Val F1"].append(val_f1_wise)
         
         df = pd.DataFrame(results)
-        print("\n--- Current F1 Score Summary (Entropy) ---")
+        print("\n--- Current F1 Score Summary (BADGE) ---")
         print(df)
 
-    print("\n--- Final F1 Score Summary (Entropy) ---")
+    print("\n--- Final F1 Score Summary (BADGE) ---")
     df = pd.DataFrame(results)
-    df.to_csv(OUTPUT_DIR_WISE / "results_entropy.csv", index=False)
+    df.to_csv(OUTPUT_DIR_WISE / "results_badge.csv", index=False)
     print(df)
 
 if __name__ == '__main__':
