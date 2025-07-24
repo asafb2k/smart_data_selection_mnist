@@ -23,8 +23,8 @@ NUM_EPOCHS = 10
 BATCH_SIZE = 256
 LEARNING_RATE = 0.001
 ITERATIONS = 20
-OUTPUT_DIR_RANDOM = Path("output/random_vs_entropy/random")
-OUTPUT_DIR_WISE = Path("output/random_vs_entropy/entropy")
+OUTPUT_DIR_RANDOM = Path("output_confidence_based_approach/random")
+OUTPUT_DIR_WISE = Path("output_confidence_based_approach/wize")
 
 # --- Determinism ---
 torch.manual_seed(SEED)
@@ -102,41 +102,29 @@ def evaluate(model, loader, device):
             all_labels.extend(target.cpu().numpy())
     return f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
-def select_by_entropy(pool_loader, model, k, device):
-    """
-    Selects k samples from the pool based on the highest predictive entropy.
-
-    Entropy-based sampling is a powerful active learning strategy that measures the model's uncertainty.
-    - A low entropy value means the model is very confident about one class (e.g., [0.9, 0.05, 0.05]).
-    - A high entropy value means the model's predictions are spread out across multiple classes,
-      indicating high uncertainty (e.g., [0.33, 0.33, 0.34]).
-
-    Compared to the simpler least-confidence strategy (which only considers the probability of the
-    most likely class), entropy considers the entire probability distribution. This allows it to
-    better capture samples where the model is confused between several classes, making them highly
-    informative for the next training iteration.
-    """
+def select_wise(pool_loader, model, k, device):
     model.eval()
-    entropies = []
+    confidences = []
+    indices = []
     
     with torch.no_grad():
-        # A full pass over the pool is needed to calculate entropy for each sample.
-        for data, _ in pool_loader:
+        for i, (data, _) in enumerate(pool_loader):
             data = data.to(device)
             output = model(data)
-            # Use log_softmax for better numerical stability when calculating entropy.
-            log_probs = F.log_softmax(output, dim=1)
-            probs = torch.exp(log_probs)
-            # The entropy is the negative sum of p(x) * log(p(x))
-            entropy = -torch.sum(probs * log_probs, dim=1)
-            entropies.extend(entropy.cpu().numpy())
+            probs = F.softmax(output, dim=1)
+            max_probs, _ = torch.max(probs, dim=1)
+            confidences.extend(max_probs.cpu().numpy())
+            # Assuming pool_loader is not shuffled and batch size is 1
+            # to correctly map back to original indices. Let's make it more robust.
+            start_idx = i * pool_loader.batch_size
+            end_idx = start_idx + len(data)
+            indices.extend(list(range(start_idx, end_idx)))
 
-    entropies = np.array(entropies)
-    # We want the indices with the highest entropy, so we sort in descending order.
-    # np.argsort on the negative entropies gives us the indices from highest to lowest.
-    selected_indices = np.argsort(-entropies)[:k]
+    confidences = np.array(confidences)
+    # Select indices with the lowest confidence
+    selected_indices = np.argsort(confidences)[:k]
     
-    # Map the selected indices back to their original indices in the full dataset.
+    # Map back to original pool indices
     original_indices = [pool_loader.dataset.indices[i] for i in selected_indices]
     
     return original_indices
@@ -270,7 +258,7 @@ def main():
         plot_tsne(test_features_rand, test_labels, tsne_title_rand, OUTPUT_DIR_RANDOM / f"tsne_p{p:02d}.png")
 
 
-        # --- Wise (Entropy-Based) Sampling ---
+        # --- Wise (Confidence-Based) Sampling ---
         num_new_samples_wise = target_size - len(acquired_indices_wise)
         if num_new_samples_wise > 0:
             if p == 1:
@@ -281,7 +269,7 @@ def main():
                 remaining_pool_wise_subset = Subset(full_train_dataset, remaining_pool_indices_wise)
                 pool_loader_wise = DataLoader(remaining_pool_wise_subset, batch_size=BATCH_SIZE, shuffle=False)
                 
-                new_indices_wise = select_by_entropy(pool_loader_wise, wise_selection_model, num_new_samples_wise, DEVICE)
+                new_indices_wise = select_wise(pool_loader_wise, wise_selection_model, num_new_samples_wise, DEVICE)
 
             acquired_indices_wise.extend(new_indices_wise)
             remaining_pool_indices_wise = [idx for idx in remaining_pool_indices_wise if idx not in new_indices_wise]
@@ -305,7 +293,7 @@ def main():
                 features = model_wise.get_features(data.to(DEVICE))
                 test_features_wise.append(features.cpu().numpy())
         test_features_wise = np.concatenate(test_features_wise, axis=0)
-        tsne_title_wise = f"Wise (Entropy) – {p}% Trained – Test F1={test_f1_wise:.4f}"
+        tsne_title_wise = f"Wise – {p}% Trained – Test F1={test_f1_wise:.4f}"
         plot_tsne(test_features_wise, test_labels, tsne_title_wise, OUTPUT_DIR_WISE / f"tsne_p{p:02d}.png")
         
         results["Percentage"].append(p)
@@ -323,7 +311,7 @@ def main():
     # --- Final Summary ---
     print("\n--- Final F1 Score Summary ---")
     df = pd.DataFrame(results)
-    df.to_csv(OUTPUT_DIR_WISE / "results_entropy.csv", index=False)
+    df.to_csv(OUTPUT_DIR_RANDOM / "results.csv", index=False)
     print(df)
 
 if __name__ == '__main__':
